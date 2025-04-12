@@ -59,48 +59,79 @@ async function setupQueue() {
 }
 async function initializeIndex() {
   try {
-    // Check if the index exists
-    const indexExists = await esClient.indices.exists({ index: "plans" });
+    console.log("Checking Elasticsearch connection...");
+    const pingResult = await esClient.ping();
+    console.log("Elasticsearch ping result:", pingResult);
 
     // Delete existing index if it exists
-    if (indexExists.body) {
-      console.log("⏳ Deleting existing 'plans' index...");
-      await esClient.indices.delete({ index: "plans" });
-      console.log("✅ Deleted existing 'plans' index.");
+    try {
+      const indexExists = await esClient.indices.exists({ index: "plans" });
+      if (indexExists.body) {
+        console.log(
+          "⚠️ Deleting existing 'plans' index to recreate with proper mapping"
+        );
+        await esClient.indices.delete({ index: "plans" });
+        console.log("✅ Existing index deleted");
+      }
+    } catch (checkError) {
+      console.warn("Error checking if index exists:", checkError.message);
     }
 
-    // Create a new index with proper join field mapping
-    console.log("⏳ Creating new 'plans' index with join mapping...");
-    await esClient.indices.create({
-      index: "plans",
-      body: {
-        mappings: {
-          properties: {
-            join_field: {
-              type: "join",
-              relations: {
-                plan: ["linkedPlanService", "plancostshare"],
-                linkedPlanService: ["childOfLinkedPlanService"],
+    // Create the index with proper mapping
+    try {
+      console.log("Creating 'plans' index with proper mapping...");
+      await esClient.indices.create({
+        index: "plans",
+        body: {
+          settings: {
+            number_of_shards: 1,
+            number_of_replicas: 0,
+          },
+          mappings: {
+            properties: {
+              // Define join_field properly
+              join_field: {
+                type: "join",
+                relations: {
+                  plan: ["linkedPlanService", "plancostshare"],
+                  linkedPlanService: ["childOfLinkedPlanService"],
+                },
               },
+              // Ensure important fields are properly mapped
+              objectId: { type: "keyword" },
+              objectType: { type: "keyword" },
+              planType: { type: "keyword" },
+              _org: { type: "keyword" },
+              creationDate: {
+                type: "date",
+                format: "strict_date_optional_time||yyyy-MM-dd||dd-MM-yyyy",
+              },
+              // Map planCostShares.copay as number
+              "planCostShares.copay": { type: "float" },
+              "planCostShares.deductible": { type: "float" },
             },
           },
         },
-      },
-    });
-    console.log("✅ Created 'plans' index with parent-child mapping.");
-  } catch (err) {
-    if (
-      err.meta &&
-      err.meta.body &&
-      err.meta.body.error &&
-      err.meta.body.error.type === "resource_already_exists_exception"
-    ) {
-      console.warn("⚠️ Tried to create 'plans' index, but it already exists.");
-    } else {
-      console.error("❌ Error creating 'plans' index:", err);
+      });
+      console.log("✅ 'plans' index created successfully with proper mapping");
+    } catch (createError) {
+      console.error("Error creating index:", createError);
+      if (
+        createError.meta &&
+        createError.meta.body &&
+        createError.meta.body.error &&
+        createError.meta.body.error.type === "resource_already_exists_exception"
+      ) {
+        console.warn("Index already exists, continuing anyway");
+      } else {
+        throw createError;
+      }
     }
+  } catch (error) {
+    console.error("❌ Error during index initialization:", error);
   }
 }
+
 // Initialize Elasticsearch index with robust error handling
 // async function initializeIndex() {
 //   try {
@@ -474,83 +505,201 @@ function verifyGoogleToken(req, res, next) {
 // }
 async function consumeQueue() {
   if (!channel) {
-    console.error("❌ RabbitMQ channel not initialized.");
+    console.error("❌ RabbitMQ channel not initialized!");
     return;
   }
+
+  console.log("Starting message consumer for indexingQueue");
 
   channel.consume("indexingQueue", async (msg) => {
     if (msg !== null) {
       try {
+        console.log("Received message from queue");
         const data = JSON.parse(msg.content.toString());
+        console.log(`Processing message for plan ${data.objectId}`);
 
-        // Index the parent "plan" with CORRECT join_field format
-        await esClient.index({
-          index: "plans",
-          id: data.objectId,
-          body: {
-            ...data,
-            join_field: {
-              name: "plan", // FIXED: Changed from string to object format
-            },
-          },
-        });
-
-        // Index planCostShares as a child document
-        if (data.planCostShares && data.planCostShares.objectId) {
+        try {
+          // Index the parent plan document
+          console.log(`Indexing parent plan ${data.objectId}`);
           await esClient.index({
             index: "plans",
-            id: data.planCostShares.objectId,
-            routing: data.objectId, // Important for parent-child relationships
+            id: data.objectId,
             body: {
-              ...data.planCostShares,
+              ...data,
               join_field: {
-                name: "plancostshare",
-                parent: data.objectId,
+                name: "plan", // CORRECT format: object with name property
               },
             },
+            refresh: true, // Make immediately searchable
           });
-        }
+          console.log(`✅ Indexed parent plan ${data.objectId}`);
 
-        // Index each "linkedPlanService" as a child (same as your friend's code)
-        if (data.linkedPlanServices && Array.isArray(data.linkedPlanServices)) {
-          for (const service of data.linkedPlanServices) {
+          // Index planCostShares as a child document
+          if (data.planCostShares && data.planCostShares.objectId) {
+            console.log(
+              `Indexing plan cost shares ${data.planCostShares.objectId}`
+            );
             await esClient.index({
               index: "plans",
-              id: service.objectId,
-              routing: data.objectId, // route to parent
+              id: data.planCostShares.objectId,
+              routing: data.objectId, // IMPORTANT! Child needs parent routing
               body: {
-                ...service,
+                ...data.planCostShares,
                 join_field: {
-                  name: "linkedPlanService",
+                  name: "plancostshare",
                   parent: data.objectId,
                 },
               },
+              refresh: true,
             });
+            console.log(
+              `✅ Indexed child planCostShares ${data.planCostShares.objectId}`
+            );
+          }
 
-            // Add the childOfLinkedPlanService as in your friend's code
-            await esClient.index({
-              index: "plans",
-              id: `${service.objectId}-child`,
-              routing: service.objectId, // routing must be the parent's ID
-              body: {
-                dummyField: "child doc under linkedPlanService",
-                join_field: {
-                  name: "childOfLinkedPlanService",
-                  parent: service.objectId,
+          // Index linkedPlanServices as children
+          if (
+            data.linkedPlanServices &&
+            Array.isArray(data.linkedPlanServices)
+          ) {
+            console.log(
+              `Indexing ${data.linkedPlanServices.length} linkedPlanServices`
+            );
+
+            for (const service of data.linkedPlanServices) {
+              // Index the linkedPlanService
+              await esClient.index({
+                index: "plans",
+                id: service.objectId,
+                routing: data.objectId, // IMPORTANT! Child needs parent routing
+                body: {
+                  ...service,
+                  join_field: {
+                    name: "linkedPlanService",
+                    parent: data.objectId,
+                  },
                 },
-              },
-            });
+                refresh: true,
+              });
+              console.log(`✅ Indexed linkedPlanService ${service.objectId}`);
+
+              // Also index children of linkedPlanService
+              try {
+                await esClient.index({
+                  index: "plans",
+                  id: `${service.objectId}-child`,
+                  routing: service.objectId, // This child's parent is the linkedPlanService
+                  body: {
+                    dummyField: "child doc under linkedPlanService",
+                    join_field: {
+                      name: "childOfLinkedPlanService",
+                      parent: service.objectId,
+                    },
+                  },
+                  refresh: true,
+                });
+                console.log(
+                  `✅ Indexed child of linkedPlanService ${service.objectId}`
+                );
+              } catch (childError) {
+                console.error(
+                  `Error indexing child of service ${service.objectId}:`,
+                  childError
+                );
+                // Continue with other services
+              }
+            }
+          }
+        } catch (esError) {
+          console.error(`❌ Elasticsearch error:`, esError);
+          if (esError.meta && esError.meta.body) {
+            console.error(
+              "Error details:",
+              JSON.stringify(esError.meta.body, null, 2)
+            );
           }
         }
 
+        // Acknowledge the message
         channel.ack(msg);
+        console.log(`✅ Processed plan ${data.objectId}`);
       } catch (error) {
         console.error(`❌ Error processing message:`, error);
-        channel.ack(msg); // Still acknowledge to avoid blocking the queue
+        // Still ack to avoid blocking the queue
+        channel.ack(msg);
       }
     }
   });
 }
+
+// 4. HELPER FUNCTION TO CHECK ELASTICSEARCH SETUP
+async function checkElasticsearchSetup() {
+  try {
+    console.log("Checking Elasticsearch setup...");
+
+    // Check connection
+    const pingResult = await esClient.ping();
+    console.log("Connection test:", pingResult ? "SUCCESS" : "FAILED");
+
+    // Check index existence
+    const indexExists = await esClient.indices.exists({ index: "plans" });
+    console.log(
+      "Index existence:",
+      indexExists.body ? "EXISTS" : "DOES NOT EXIST"
+    );
+
+    if (indexExists.body) {
+      // Check mapping
+      const mapping = await esClient.indices.getMapping({ index: "plans" });
+      console.log("Index mapping:", JSON.stringify(mapping.body, null, 2));
+
+      // Check if join_field is properly configured
+      const properties = mapping.body.plans.mappings.properties;
+      const joinField = properties.join_field;
+
+      if (joinField && joinField.type === "join") {
+        console.log("Join field is properly configured");
+        console.log("Relations:", JSON.stringify(joinField.relations, null, 2));
+      } else {
+        console.log("Join field is NOT properly configured!");
+      }
+
+      // Check document count
+      const count = await esClient.count({ index: "plans" });
+      console.log("Document count:", count.body.count);
+
+      // Get some sample documents
+      const result = await esClient.search({
+        index: "plans",
+        body: {
+          size: 5,
+          query: {
+            match_all: {},
+          },
+        },
+      });
+
+      if (result.body.hits.total.value > 0) {
+        console.log("Sample documents:");
+        result.body.hits.hits.forEach((hit) => {
+          console.log(
+            `- ID: ${hit._id}, Type: ${
+              hit._source.join_field ? hit._source.join_field.name : "unknown"
+            }`
+          );
+        });
+      } else {
+        console.log("No documents found in index");
+      }
+    }
+
+    return "Elasticsearch check completed";
+  } catch (error) {
+    console.error("Error checking Elasticsearch setup:", error);
+    return `Error: ${error.message}`;
+  }
+}
+
 // CREATE: Store Data in Redis & Index in Elasticsearch
 app.post("/v1/plan", verifyGoogleToken, async (req, res) => {
   const data = req.body;
@@ -598,7 +747,19 @@ app.post("/v1/plan", verifyGoogleToken, async (req, res) => {
     return res.status(500).json({ error: "Failed to create plan" });
   }
 });
-
+app.get("/v1/elasticsearch/check", verifyGoogleToken, async (req, res) => {
+  try {
+    const result = await checkElasticsearchSetup();
+    return res.json({
+      message: "Elasticsearch check completed",
+      details: result,
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ error: "Failed to check Elasticsearch", message: error.message });
+  }
+});
 // PATCH: Update an existing plan
 app.patch("/v1/plan/:id", verifyGoogleToken, async (req, res) => {
   const planId = req.params.id;
@@ -607,14 +768,22 @@ app.patch("/v1/plan/:id", verifyGoogleToken, async (req, res) => {
   try {
     // Retrieve the current plan from Redis
     const planData = await redis.get(planId);
+    console.log(
+      "PATCH: Plan retrieval from Redis:",
+      planId,
+      planData ? "found" : "NOT found"
+    );
+
     if (!planData) {
       return res.status(404).json({ error: "Plan not found" });
     }
 
     let plan = JSON.parse(planData);
+    console.log("PATCH: Working with plan ID:", plan.objectId);
 
     // Get If-Match ETag from the request header
     const clientEtag = req.header("If-Match");
+    console.log("PATCH: Client ETag:", clientEtag, "Plan ETag:", plan.etag);
 
     // If ETag does not match, reject the update
     if (!clientEtag || clientEtag !== plan.etag) {
@@ -647,70 +816,28 @@ app.patch("/v1/plan/:id", verifyGoogleToken, async (req, res) => {
         plan[key] = data[key];
       }
     });
+    console.log("PATCH: Merged updates into plan");
 
     // Regenerate the ETag for the updated plan
     const newEtag = generateEtag(plan);
     plan.etag = newEtag; // Ensure the etag is included in the stored plan
+    console.log("PATCH: Generated new ETag:", newEtag);
 
     // Store the updated plan back in Redis
     await redis.set(planId, JSON.stringify(plan));
+    console.log("PATCH: Updated plan stored in Redis");
 
     // Queue indexing operation for Elasticsearch
-    if (channel) {
-      try {
-        // Make sure the channel is connected
-        if (channel.connection && channel.connection.isOpen) {
-          console.log(
-            `Queuing updated plan ${planId} for Elasticsearch indexing`
-          );
-
-          channel.sendToQueue(
-            "indexingQueue",
-            Buffer.from(JSON.stringify(plan)),
-            {
-              persistent: true,
-              contentType: "application/json",
-              // Add message properties to help with debugging
-              headers: {
-                operation: "update",
-                timestamp: Date.now(),
-              },
-            }
-          );
-
-          console.log(`✅ Updated plan ${planId} queued for indexing`);
-        } else {
-          console.error("❌ RabbitMQ channel connection is closed");
-          // Attempt to reconnect
-          await setupQueue();
-          if (channel && channel.connection && channel.connection.isOpen) {
-            channel.sendToQueue(
-              "indexingQueue",
-              Buffer.from(JSON.stringify(plan)),
-              {
-                persistent: true,
-                headers: {
-                  operation: "update",
-                  timestamp: Date.now(),
-                },
-              }
-            );
-            console.log(
-              `✅ After reconnect: Updated plan ${planId} queued for indexing`
-            );
-          }
-        }
-      } catch (queueError) {
-        console.error(
-          "❌ Error queuing message for Elasticsearch:",
-          queueError
-        );
-        console.log(
-          "⚠️ Plan updated in Redis but not queued for Elasticsearch"
-        );
+    try {
+      if (channel) {
+        channel.sendToQueue("indexingQueue", Buffer.from(JSON.stringify(plan)));
+        console.log("PATCH: Plan queued for Elasticsearch indexing");
+      } else {
+        console.error("PATCH: RabbitMQ channel not available!");
       }
-    } else {
-      console.error("❌ RabbitMQ channel not available for sending message");
+    } catch (queueError) {
+      console.error("PATCH: Error queueing for Elasticsearch:", queueError);
+      // Continue anyway - at least Redis got updated
     }
 
     res.set({
@@ -721,8 +848,10 @@ app.patch("/v1/plan/:id", verifyGoogleToken, async (req, res) => {
 
     return res.status(200).json(plan);
   } catch (error) {
-    console.error("❌ Error updating plan:", error);
-    return res.status(500).json({ error: "Failed to update plan" });
+    console.error("PATCH: Error processing request:", error);
+    return res
+      .status(500)
+      .json({ error: "Failed to update plan", message: error.message });
   }
 });
 
