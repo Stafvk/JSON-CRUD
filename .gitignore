@@ -1,3 +1,24 @@
-package-lock.json
-node_modules
-package.json
+# Node standard
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Temporary and cache files
+*.tmp
+*.temp
+*.cache
+*.log
+.DS_Store
+
+# Random generated files
+*.bnms
+*.manifest
+*.ts
+.cache/
+dist/
+build/
+
+# Elasticsearch data
+data*/
+nodes/
+indices/
