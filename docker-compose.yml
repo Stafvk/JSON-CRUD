@@ -73,12 +73,41 @@ services:
       - elastic
     restart: always
 
+  # Add Redis service
+  redis:
+    image: redis:latest
+    container_name: redis
+    ports:
+      - 6379:6379
+    volumes:
+      - redis-data:/data
+    networks:
+      - elastic
+    restart: always
+
+  # Add RabbitMQ service
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - 5672:5672
+      - 15672:15672
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - elastic
+    restart: always
+
 volumes:
   data01:
     driver: local
   data02:
     driver: local
   data03:
+    driver: local
+  redis-data:
+    driver: local
+  rabbitmq-data:
     driver: local
 
 networks:

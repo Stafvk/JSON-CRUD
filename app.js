@@ -905,13 +905,15 @@ app.delete("/v1/plan/:id", verifyGoogleToken, async (req, res) => {
           await esClient.delete({
             index: "plans",
             id: service.objectId,
-            ignore: [404], // Ignore if not found
           });
+          console.log(`Deleted service ${service.objectId} from Elasticsearch`);
         } catch (esError) {
-          console.warn(
-            `⚠️ Could not delete child document from Elasticsearch: ${esError.message}`
-          );
-          // Continue with deletion process
+          // Only log if it's not a 404 (not found) error
+          if (!esError.meta || esError.meta.statusCode !== 404) {
+            console.warn(
+              `⚠️ Could not delete child document from Elasticsearch: ${esError.message}`
+            );
+          }
         }
       }
     }
@@ -924,12 +926,16 @@ app.delete("/v1/plan/:id", verifyGoogleToken, async (req, res) => {
         await esClient.delete({
           index: "plans",
           id: plan.planCostShares.objectId,
-          ignore: [404],
         });
-      } catch (esError) {
-        console.warn(
-          `⚠️ Could not delete planCostShares from Elasticsearch: ${esError.message}`
+        console.log(
+          `Deleted planCostShares ${plan.planCostShares.objectId} from Elasticsearch`
         );
+      } catch (esError) {
+        if (!esError.meta || esError.meta.statusCode !== 404) {
+          console.warn(
+            `⚠️ Could not delete planCostShares from Elasticsearch: ${esError.message}`
+          );
+        }
       }
     }
 
@@ -940,13 +946,14 @@ app.delete("/v1/plan/:id", verifyGoogleToken, async (req, res) => {
       await esClient.delete({
         index: "plans",
         id: planId,
-        ignore: [404],
       });
+      console.log(`Deleted plan ${planId} from Elasticsearch`);
     } catch (esError) {
-      console.warn(
-        `⚠️ Could not delete document from Elasticsearch: ${esError.message}`
-      );
-      // Continue since Redis deletion was successful
+      if (!esError.meta || esError.meta.statusCode !== 404) {
+        console.warn(
+          `⚠️ Could not delete document from Elasticsearch: ${esError.message}`
+        );
+      }
     }
 
     res.status(204).end();
@@ -955,7 +962,73 @@ app.delete("/v1/plan/:id", verifyGoogleToken, async (req, res) => {
     return res.status(500).json({ error: "Failed to delete plan" });
   }
 });
+// DELETE a specific linked service from a plan
+app.delete(
+  "/v1/plan/:planId/service/:serviceId",
+  verifyGoogleToken,
+  async (req, res) => {
+    const { planId, serviceId } = req.params;
 
+    try {
+      // Get the parent plan
+      const planData = await redis.get(planId);
+      if (!planData) {
+        return res.status(404).json({ error: "Plan not found" });
+      }
+
+      let plan = JSON.parse(planData);
+
+      // Find the service to delete
+      const serviceIndex = plan.linkedPlanServices.findIndex(
+        (service) => service.objectId === serviceId
+      );
+
+      if (serviceIndex === -1) {
+        return res.status(404).json({ error: "Service not found in plan" });
+      }
+
+      // Remove the service from the plan's linkedPlanServices array
+      const removedService = plan.linkedPlanServices.splice(serviceIndex, 1)[0];
+
+      // Update the plan in Redis with the service removed
+      const newEtag = crypto
+        .createHash("md5")
+        .update(JSON.stringify(plan))
+        .digest("hex");
+      plan.etag = newEtag;
+      await redis.set(planId, JSON.stringify(plan));
+
+      // Delete the service from Redis if it was stored separately
+      await redis.del(serviceId);
+
+      // Delete from Elasticsearch
+      try {
+        await esClient.delete({
+          index: "plans",
+          id: serviceId,
+        });
+        console.log(`Deleted service ${serviceId} from Elasticsearch`);
+      } catch (esError) {
+        if (!esError.meta || esError.meta.statusCode !== 404) {
+          console.warn(
+            `⚠️ Could not delete service from Elasticsearch: ${esError.message}`
+          );
+        }
+      }
+
+      // Queue the updated plan for reindexing
+      if (channel) {
+        channel.sendToQueue("indexingQueue", Buffer.from(JSON.stringify(plan)));
+        console.log(`Updated plan queued for reindexing`);
+      }
+
+      res.status(204).end();
+    } catch (error) {
+      console.error("❌ Error deleting service:", error);
+      return res.status(500).json({ error: "Failed to delete service" });
+    }
+  }
+);
 // SEARCH: Query Data in Elasticsearch with fallback to Redis
 app.get("/v1/search", verifyGoogleToken, async (req, res) => {
   const query = req.query.q;
